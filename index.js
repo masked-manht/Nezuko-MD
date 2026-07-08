@@ -33,6 +33,7 @@ async function startNezuko() {
         if (qr) {
             try {
                 qrCodeImage = await QRCode.toDataURL(qr);
+                botStatus = "Associez votre appareil WhatsApp"; 
             } catch (err) {
                 console.error("Erreur QR :", err);
             }
@@ -40,9 +41,15 @@ async function startNezuko() {
 
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            botStatus = shouldReconnect ? "Déconnecté. Reconnexion..." : "Session expirée. Veuillez redémarrer.";
-            qrCodeImage = null;
-            currentPairCode = null;
+            
+            if (!shouldReconnect) {
+                botStatus = "Session expirée. Réinitialisation...";
+                qrCodeImage = null;
+                currentPairCode = null;
+            } else {
+                botStatus = "En attente d'association... (Prêt)";
+            }
+            
             if (shouldReconnect) startNezuko();
         } else if (connection === 'open') {
             botStatus = "Nezuko-v1 est connecté et actif ! ✅";
@@ -66,11 +73,10 @@ app.post('/api/paircode', async (req, res) => {
     let num = req.body.number;
     if (!num) return res.status(400).send({ error: "Numéro manquant" });
     
-    num = num.replace(/[^0-9]/g, ''); // Nettoyage du numéro
+    num = num.replace(/[^0-9]/g, ''); // Nettoie le numéro pour ne garder que les chiffres
     
     try {
         if (sockInstance && !sockInstance.authState.creds.registered) {
-            // Demande le code de couplage à 8 caractères à l'API de Baileys
             let code = await sockInstance.requestPairingCode(num);
             currentPairCode = code.match(/.{1,4}/g)?.join('-') || code;
             return res.send({ code: currentPairCode });
@@ -78,11 +84,12 @@ app.post('/api/paircode', async (req, res) => {
             return res.send({ code: "Déjà connecté ou indisponible" });
         }
     } catch (err) {
+        console.error("Erreur génération Pair Code :", err);
         return res.status(500).send({ error: "Erreur serveur" });
     }
 });
 
-// --- INTERFACE WEB ENTIÈREMENT RESTYLÉE ---
+// --- INTERFACE WEB ---
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -96,9 +103,8 @@ app.get('/', (req, res) => {
                 .card { background: #ffffff; padding: 30px 20px; border-radius: 20px; display: inline-block; box-shadow: 0 10px 40px rgba(0,0,0,0.06); max-width: 450px; width: 100%; box-sizing: border-box; border: 1px solid #eaeaea; }
                 .avatar { width: 80px; height: 80px; background: #000; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 15px; font-size: 40px; }
                 h1 { font-size: 1.6em; font-weight: bold; margin: 0 0 5px 0; color: #000000; }
-                .status { font-size: 0.95em; color: #666666; margin-bottom: 25px; }
+                .status { font-size: 0.95em; color: #ff4a5a; font-weight: 600; margin-bottom: 25px; }
                 
-                /* Système d'onglets comme sur ta capture */
                 .tabs { display: flex; background: #f0f0f0; border-radius: 12px; padding: 4px; margin-bottom: 20px; }
                 .tab-btn { flex: 1; padding: 12px; border: none; background: transparent; font-weight: bold; font-size: 0.9em; cursor: pointer; border-radius: 10px; transition: 0.2s; color: #555; }
                 .tab-btn.active { background: #ffffff; color: #000000; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
@@ -106,15 +112,13 @@ app.get('/', (req, res) => {
                 .content-section { display: none; }
                 .content-section.active { display: block; }
                 
-                /* Input et Boutons */
                 .input-title { text-align: left; font-size: 0.9em; font-weight: bold; margin-bottom: 8px; color: #333; }
                 input { width: 100%; padding: 14px; border: 1px solid #dddddd; border-radius: 12px; font-size: 1em; box-sizing: border-box; background: #f9f9f9; text-align: center; margin-bottom: 15px; }
                 button.action-btn { width: 100%; padding: 14px; border: none; background: #000000; color: #fff; font-size: 1em; font-weight: bold; border-radius: 12px; cursor: pointer; transition: 0.2s; }
                 button.action-btn:hover { background: #222; }
                 
-                .result-box { background: #f4f4f6; padding: 14px; border-radius: 12px; font-weight: bold; font-size: 1.1em; margin-top: 15px; border: 1px dashed #ccc; letter-spacing: 2px; }
+                .result-box { background: #f4f4f6; padding: 14px; border-radius: 12px; font-weight: bold; font-size: 1.4em; margin-top: 15px; border: 1px dashed #000; letter-spacing: 2px; color: #000; }
                 
-                /* QR Code style */
                 .qr-container img { background: white; padding: 10px; border: 1px solid #eee; border-radius: 12px; width: 220px; height: 220px; margin-top: 10px; }
                 .instructions { font-size: 0.85em; color: #777; line-height: 1.6; margin-top: 15px; text-align: left; background: #f9f9f9; padding: 15px; border-radius: 12px; }
                 
@@ -125,7 +129,7 @@ app.get('/', (req, res) => {
             <div class="card">
                 <div class="avatar">🤖</div>
                 <h1>Code de paire de bots Nezuko-v1</h1>
-                <div class="status">${botStatus}</div>
+                <div class="status" id="state-status">${botStatus}</div>
                 
                 <div class="tabs">
                     <button class="tab-btn active" onclick="switchTab('pair-section', this)">🔑 Code de paire</button>
@@ -134,7 +138,7 @@ app.get('/', (req, res) => {
                 
                 <div id="pair-section" class="content-section active">
                     <div class="input-title">Saisissez votre numéro WhatsApp avec l'indicatif du pays :</div>
-                    <input type="text" id="phone-number" placeholder="+5093542014" value="5093542014">
+                    <input type="text" id="phone-number" placeholder="5093542014" value="5093542014">
                     <button class="action-btn" onclick="getPairCode()">🔑 Générer un code de paire</button>
                     <div id="code-display" class="result-box" style="display:none;"></div>
                 </div>
@@ -157,49 +161,4 @@ app.get('/', (req, res) => {
             <script>
                 function switchTab(sectionId, btn) {
                     document.querySelectorAll('.content-section').forEach(s => s.classList.remove('active'));
-                    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                    document.getElementById(sectionId).classList.add('active');
-                    btn.classList.add('active');
-                }
-
-                async function getPairCode() {
-                    const num = document.getElementById('phone-number').value;
-                    const display = document.getElementById('code-display');
-                    display.style.display = 'block';
-                    display.innerText = "Génération...";
-                    
-                    try {
-                        const response = await fetch('/api/paircode', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ number: num })
-                        });
-                        const data = await response.json();
-                        if(data.code) {
-                            display.innerText = data.code;
-                        } else {
-                            display.innerText = "Erreur ou déjà connecté";
-                        }
-                    } catch(e) {
-                        display.innerText = "Erreur de connexion";
-                    }
-                }
-                
-                // Rafraîchit le QR code discrètement en arrière-plan toutes les 15 secondes si l'onglet QR est ouvert
-                setInterval(async () => {
-                    if(document.getElementById('qr-section').classList.contains('active')) {
-                        // Optionnel : recharger la page pour choper le nouveau QR mis à jour
-                        window.location.reload();
-                    }
-                }, 15000);
-            </script>
-        </body>
-        </html>
-    `);
-});
-
-app.listen(port, () => {
-    console.log(`Serveur Web actif sur le port : ${port}`);
-});
-
-startNezuko();
+                    document
