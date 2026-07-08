@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const express = require('express');
 const QRCode = require('qrcode');
@@ -14,6 +14,7 @@ let qrCodeImage = null;
 let currentPairCode = null;
 let botStatus = "Associez votre appareil WhatsApp";
 let sockInstance = null;
+let isSocketReady = false;
 
 async function startNezuko() {
     const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'session'));
@@ -21,7 +22,9 @@ async function startNezuko() {
     const sock = makeWASocket({
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
-        auth: state
+        auth: state,
+        browser: Browsers.ubuntu('Chrome'),
+        syncFullHistory: false
     });
 
     sockInstance = sock;
@@ -34,12 +37,14 @@ async function startNezuko() {
             try {
                 qrCodeImage = await QRCode.toDataURL(qr);
                 botStatus = "Associez votre appareil WhatsApp"; 
+                isSocketReady = true;
             } catch (err) {
                 console.error("Erreur QR :", err);
             }
         }
 
         if (connection === 'close') {
+            isSocketReady = false;
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             
             if (!shouldReconnect) {
@@ -48,20 +53,23 @@ async function startNezuko() {
                 currentPairCode = null;
             } else {
                 botStatus = "En attente d'association... (Prêt)";
+                isSocketReady = true;
             }
             
             if (shouldReconnect) startNezuko();
         } else if (connection === 'open') {
+            isSocketReady = false;
             botStatus = "Nezuko-v1 est connecté et actif ! ✅";
             qrCodeImage = null;
             currentPairCode = null;
         }
     });
 
+    // Éviter les crashs sur la réception des messages avant configuration complète
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         try {
             const mek = chatUpdate.messages[0];
-            if (!mek.message) return;
+            if (!mek || !mek.message) return;
         } catch (err) {
             console.error(err);
         }
@@ -75,13 +83,17 @@ app.post('/api/paircode', async (req, res) => {
     
     num = num.replace(/[^0-9]/g, '');
     
+    if (!sockInstance || !isSocketReady) {
+        return res.send({ code: "Le serveur démarre. Attends 5 secondes." });
+    }
+    
     try {
-        if (sockInstance && !sockInstance.authState.creds.registered) {
+        if (!sockInstance.authState.creds.registered) {
             let code = await sockInstance.requestPairingCode(num);
             currentPairCode = code.match(/.{1,4}/g)?.join('-') || code;
             return res.send({ code: currentPairCode });
         } else {
-            return res.send({ code: "Déjà connecté ou indisponible" });
+            return res.send({ code: "Déjà connecté" });
         }
     } catch (err) {
         console.error("Erreur génération Pair Code :", err);
@@ -89,9 +101,17 @@ app.post('/api/paircode', async (req, res) => {
     }
 });
 
+// --- API POUR ENVOYER LE STATUT ACTUEL AU FRONTEND ---
+app.get('/api/status', (req, res) => {
+    res.json({
+        status: botStatus,
+        qr: qrCodeImage
+    });
+});
+
 // --- INTERFACE WEB ---
 app.get('/', (req, res) => {
-    const htmlContent = `
+    res.send(`
     <!DOCTYPE html>
     <html lang="fr">
     <head>
@@ -129,7 +149,7 @@ app.get('/', (req, res) => {
         <div class="card">
             <div class="avatar">🤖</div>
             <h1>Code de paire de bots Nezuko-v1</h1>
-            <div class="status">${botStatus}</div>
+            <div class="status" id="bot-status-text">Chargement...</div>
             
             <div class="tabs">
                 <button class="tab-btn active" onclick="switchTab('pair-section', this)">🔑 Code de paire</button>
@@ -144,8 +164,8 @@ app.get('/', (req, res) => {
             </div>
             
             <div id="qr-section" class="content-section">
-                <div class="qr-container">
-                    ${qrCodeImage ? `<img src="\${qrCodeImage}" alt="QR Code">` : '<p style="color:#888; padding:40px 0;">Génération du QR Code en cours (ou déjà connecté)...</p>'}
+                <div class="qr-container" id="qr-image-wrap">
+                    <p style="color:#888; padding:40px 0;">Chargement du QR Code...</p>
                 </div>
                 <div class="instructions">
                     1. Ouvrez WhatsApp sur votre téléphone.<br>
@@ -164,6 +184,24 @@ app.get('/', (req, res) => {
                 document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
                 document.getElementById(sectionId).classList.add('active');
                 btn.classList.add('active');
+            }
+
+            // Met à jour dynamiquement le statut et le QR sans recharger la page complète
+            async function updateStatus() {
+                try {
+                    const res = await fetch('/api/status');
+                    const data = await res.json();
+                    document.getElementById('bot-status-text').innerText = data.status;
+                    
+                    const qrWrap = document.getElementById('qr-image-wrap');
+                    if (data.qr) {
+                        qrWrap.innerHTML = '<img src="' + data.qr + '" alt="QR Code">';
+                    } else if (data.status.includes('connecté')) {
+                        qrWrap.innerHTML = '<p style="color:green; padding:40px 0; font-weight:bold;">Connecté avec succès ! ✅</p>';
+                    } else {
+                        qrWrap.innerHTML = '<p style="color:#888; padding:40px 0;">Génération du QR Code en cours...</p>';
+                    }
+                } catch(e) {}
             }
 
             async function getPairCode() {
@@ -188,10 +226,14 @@ app.get('/', (req, res) => {
                     display.innerText = "Erreur de connexion";
                 }
             }
+
+            // Actualisation automatique toutes les 3 secondes
+            setInterval(updateStatus, 3000);
+            updateStatus();
         </script>
     </body>
-    </html>`;
-    res.send(htmlContent);
+    </html>
+    `);
 });
 
 app.listen(port, () => {
@@ -199,3 +241,4 @@ app.listen(port, () => {
 });
 
 startNezuko();
+            
