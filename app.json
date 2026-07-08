@@ -1,8 +1,8 @@
 {
-  "name": "Knight Bot MINI",
-  "description": "WhatsApp MD bot (Baileys)",
+  "name": "Nezuko-v1",
+  "description": "WhatsApp MD Bot ultra-rapide basé sur Baileys et optimisé pour Render.",
   "repository": "",
-  "keywords": ["whatsapp", "baileys", "bot", "node"],
+  "keywords": ["whatsapp", "baileys", "bot", "node", "nezuko"],
   "buildpacks": [
     {
       "url": "https://github.com/heroku/heroku-buildpack-nodejs.git"
@@ -10,10 +10,9 @@
   ],
   "env": {
     "SESSION_ID": {
-      "description": "KnightBot session string (e.g. KnightBot!<base64_compressed_data>)",
+      "description": "Ta chaîne de session optionnelle (ex: Nezuko_id!<données_base64>). Laisse vide si tu préfères scanner le QR code directement dans les logs de Render.",
       "required": false,
       "value": ""
     }
   }
 }
-
