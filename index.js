@@ -1,441 +1,111 @@
-/**
- * WhatsApp MD Bot - Main Entry Point (Optimized for Render Deployment)
- */
-process.env.PUPPETEER_SKIP_DOWNLOAD = 'true';
-process.env.PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = 'true';
-process.env.PUPPETEER_CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer_cache_disabled';
-
-// --- AJOUT OBLIGATOIRE POUR RENDER : SERVEUR EXPRESS ---
-const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-    res.send('⚡ KnightBot-MD est en ligne et opérationnel sur Render !');
-});
-
-app.listen(PORT, () => {
-    console.log(`[RENDER] Serveur HTTP d'écoute activé avec succès sur le port ${PORT}`);
-});
-// -------------------------------------------------------
-
-const { initializeTempSystem } = require('./utils/tempManager');
-const { startCleanup } = require('./utils/cleanup');
-initializeTempSystem();
-startCleanup();
-const originalConsoleLog = console.log;
-const originalConsoleError = console.error;
-const originalConsoleWarn = console.warn;
-
-const forbiddenPatternsConsole = [
-  'closing session',
-  'closing open session',
-  'sessionentry',
-  'prekey bundle',
-  'pendingprekey',
-  '_chains',
-  'registrationid',
-  'currentratchet',
-  'chainkey',
-  'ratchet',
-  'signal protocol',
-  'ephemeralkeypair',
-  'indexinfo',
-  'basekey'
-];
-
-console.log = (...args) => {
-  const message = args.map(a => typeof a === 'string' ? a : typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ').toLowerCase();
-  if (!forbiddenPatternsConsole.some(pattern => message.includes(pattern))) {
-    originalConsoleLog.apply(console, args);
-  }
-};
-
-console.error = (...args) => {
-  const message = args.map(a => typeof a === 'string' ? a : typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ').toLowerCase();
-  if (!forbiddenPatternsConsole.some(pattern => message.includes(pattern))) {
-    originalConsoleError.apply(console, args);
-  }
-};
-
-console.warn = (...args) => {
-  const message = args.map(a => typeof a === 'string' ? a : typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ').toLowerCase();
-  if (!forbiddenPatternsConsole.some(pattern => message.includes(pattern))) {
-    originalConsoleWarn.apply(console, args);
-  }
-};
-
-// Now safe to load libraries
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  Browsers,
-  fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
-const config = require('./config');
-const handler = require('./handler');
-const fs = require('fs');
+const express = require('express');
+const QRCode = require('qrcode');
 const path = require('path');
-const zlib = require('zlib');
-const os = require('os');
 
-// Remove Puppeteer cache (if some dependency downloaded Chromium into ~/.cache/puppeteer)
-function cleanupPuppeteerCache() {
-  try {
-    const home = os.homedir();
-    const cacheDir = path.join(home, '.cache', 'puppeteer');
+const app = express();
+const port = process.env.PORT || 10000;
 
-    if (fs.existsSync(cacheDir)) {
-      console.log('🧹 Removing Puppeteer cache at:', cacheDir);
-      fs.rmSync(cacheDir, { recursive: true, force: true });
-      console.log('✅ Puppeteer cache removed');
-    }
-  } catch (err) {
-    console.error('⚠️ Failed to cleanup Puppeteer cache:', err.message || err);
-  }
-}
-// Optimized in-memory store with hard limits (Map-based for better memory management)
-const store = {
-  messages: new Map(), // Use Map instead of plain object
-  maxPerChat: 20, // Limit to 20 messages per chat
+let qrCodeImage = null; // Stocke l'image du QR code en Base64
+let botStatus = "En attente de génération du QR Code...";
 
-  bind: (ev) => {
-    ev.on('messages.upsert', ({ messages }) => {
-      for (const msg of messages) {
-        if (!msg.key?.id) continue;
-
-        const jid = msg.key.remoteJid;
-        if (!store.messages.has(jid)) {
-          store.messages.set(jid, new Map());
-        }
-
-        const chatMsgs = store.messages.get(jid);
-        chatMsgs.set(msg.key.id, msg);
-
-        // Aggressive cleanup per chat - keep only recent messages
-        if (chatMsgs.size > store.maxPerChat) {
-          // Remove oldest message (first entry in Map)
-          const oldestKey = chatMsgs.keys().next().value;
-          chatMsgs.delete(oldestKey);
-        }
-      }
+async function startNezuko() {
+    const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'session'));
+    
+    const sock = makeWASocket({
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: true, // Affiche aussi dans la console de Render au cas où
+        auth: state
     });
-  },
 
-  loadMessage: async (jid, id) => {
-    return store.messages.get(jid)?.get(id) || null;
-  }
-};
+    sock.ev.on('creds.update', saveCreds);
 
-// Optimized message deduplication (Set-based, no timestamps needed)
-const processedMessages = new Set();
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-// Aggressive cleanup - clear every 5 minutes
-setInterval(() => {
-  processedMessages.clear();
-}, 5 * 60 * 1000); // Every 5 minutes
-
-// Custom Pino logger with suppression for Baileys noise
-const createSuppressedLogger = (level = 'silent') => {
-  const forbiddenPatterns = [
-    'closing session',
-    'closing open session',
-    'sessionentry',
-    'prekey bundle',
-    'pendingprekey',
-    '_chains',
-    'registrationid',
-    'currentratchet',
-    'chainkey',
-    'ratchet',
-    'signal protocol',
-    'ephemeralkeypair',
-    'indexinfo',
-    'basekey',
-    'sessionentry',
-    'ratchetkey'
-  ];
-
-  let logger;
-  try {
-    logger = pino({
-      level,
-      transport: process.env.NODE_ENV === 'production' ? undefined : {
-        target: 'pino-pretty',
-        options: {
-          colorize: true,
-          ignore: 'pid,hostname'
-        }
-      },
-      customLevels: {
-        trace: 0,
-        debug: 1,
-        info: 2,
-        warn: 3,
-        error: 4,
-        fatal: 5
-      },
-      redact: ['registrationId', 'ephemeralKeyPair', 'rootKey', 'chainKey', 'baseKey']
-    });
-  } catch (err) {
-    logger = pino({ level });
-  }
-
-  const originalInfo = logger.info.bind(logger);
-  logger.info = (...args) => {
-    const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ').toLowerCase();
-    if (!forbiddenPatterns.some(pattern => msg.includes(pattern))) {
-      originalInfo(...args);
-    }
-  };
-  logger.debug = () => { };
-  logger.trace = () => { };
-  return logger;
-};
-
-// Main connection function
-async function startBot() {
-  const sessionFolder = `./${config.sessionName}`;
-  const sessionFile = path.join(sessionFolder, 'creds.json');
-
-  if (config.sessionID && config.sessionID.startsWith('KnightBot!')) {
-    try {
-      const [header, b64data] = config.sessionID.split('!');
-
-      if (header !== 'KnightBot' || !b64data) {
-        throw new Error("❌ Invalid session format. Expected 'KnightBot!.....'");
-      }
-
-      const cleanB64 = b64data.replace('...', '');
-      const compressedData = Buffer.from(cleanB64, 'base64');
-      const decompressedData = zlib.gunzipSync(compressedData);
-
-      if (!fs.existsSync(sessionFolder)) {
-        fs.mkdirSync(sessionFolder, { recursive: true });
-      }
-
-      fs.writeFileSync(sessionFile, decompressedData, 'utf8');
-      console.log('📡 Session : 🔑 Retrieved from KnightBot Session');
-
-    } catch (e) {
-      console.error('📡 Session : ❌ Error processing KnightBot session:', e.message);
-    }
-  }
-
-  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-  const { version } = await fetchLatestBaileysVersion();
-
-  const suppressedLogger = createSuppressedLogger('silent');
-
-  const sock = makeWASocket({
-    version,
-    logger: suppressedLogger,
-    printQRInTerminal: false,
-    browser: ['Chrome', 'Windows', '10.0'],
-    auth: state,
-    syncFullHistory: false,
-    downloadHistory: false,
-    markOnlineOnConnect: false,
-    getMessage: async () => undefined
-  });
-
-  store.bind(sock.ev);
-
-  let lastActivity = Date.now();
-  const INACTIVITY_TIMEOUT = 30 * 60 * 1000;
-
-  sock.ev.on('messages.upsert', () => {
-    lastActivity = Date.now();
-  });
-
-  const watchdogInterval = setInterval(async () => {
-    if (Date.now() - lastActivity > INACTIVITY_TIMEOUT && sock.ws.readyState === 1) {
-      console.log('⚠️ No activity detected. Forcing reconnect...');
-      await sock.end(undefined, undefined, { reason: 'inactive' });
-      clearInterval(watchdogInterval);
-      setTimeout(() => startBot(), 5000);
-    }
-  }, 5 * 60 * 1000);
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection } = update;
-    if (connection === 'open') {
-      lastActivity = Date.now();
-    } else if (connection === 'close') {
-      clearInterval(watchdogInterval);
-    }
-  });
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log('\n\n📱 Scan this QR code with WhatsApp:\n');
-      qrcode.generate(qr, { small: true });
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
-
-      if (statusCode === 515 || statusCode === 503 || statusCode === 408) {
-        console.log(`⚠️ Connection closed (${statusCode}). Reconnecting...`);
-      } else {
-        console.log('Connection closed due to:', errorMessage, '\nReconnecting:', shouldReconnect);
-      }
-
-      if (shouldReconnect) {
-        setTimeout(() => startBot(), 3000);
-      }
-    } else if (connection === 'open') {
-      console.log('\n✅ Bot connected successfully!');
-      console.log(`📱 Bot Number: ${sock.user.id.split(':')[0]}`);
-      console.log(`🤖 Bot Name: ${config.botName}`);
-      console.log(`⚡ Prefix: ${config.prefix}`);
-      const ownerNames = Array.isArray(config.ownerName) ? config.ownerName.join(',') : config.ownerName;
-      console.log(`👑 Owner: ${ownerNames}\n`);
-      console.log('Bot is ready to receive messages!\n');
-
-      if (config.autoBio) {
-        await sock.updateProfileStatus(`${config.botName} | Active 24/7`);
-      }
-
-      handler.initializeAntiCall(sock);
-
-      const now = Date.now();
-      for (const [jid, chatMsgs] of store.messages.entries()) {
-        const timestamps = Array.from(chatMsgs.values()).map(m => m.messageTimestamp * 1000 || 0);
-        if (timestamps.length > 0 && now - Math.max(...timestamps) > 24 * 60 * 60 * 1000) {
-          store.messages.delete(jid);
-        }
-      }
-      console.log(`🧹 Store cleaned. Active chats: ${store.messages.size}`);
-    }
-  });
-
-  sock.ev.on('creds.update', saveCreds);
-
-  const isSystemJid = (jid) => {
-    if (!jid) return true;
-    return jid.includes('@broadcast') ||
-      jid.includes('status.broadcast') ||
-      jid.includes('@newsletter') ||
-      jid.includes('@newsletter.');
-  };
-
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
-    if (type !== 'notify') return;
-
-    for (const msg of messages) {
-      if (!msg.message || !msg.key?.id) continue;
-
-      const from = msg.key.remoteJid;
-      if (!from) continue;
-
-      if (isSystemJid(from)) continue;
-
-      const msgId = msg.key.id;
-      if (processedMessages.has(msgId)) continue;
-
-      const MESSAGE_AGE_LIMIT = 5 * 60 * 1000;
-      let messageAge = 0;
-      if (msg.messageTimestamp) {
-        messageAge = Date.now() - (msg.messageTimestamp * 1000);
-        if (messageAge > MESSAGE_AGE_LIMIT) continue;
-      }
-
-      processedMessages.add(msgId);
-
-      if (msg.key && msg.key.id) {
-        if (!store.messages.has(from)) {
-          store.messages.set(from, new Map());
-        }
-        const chatMsgs = store.messages.get(from);
-        chatMsgs.set(msg.key.id, msg);
-
-        if (chatMsgs.size > store.maxPerChat) {
-          const sortedIds = Array.from(chatMsgs.entries())
-            .sort((a, b) => (a[1].messageTimestamp || 0) - (b[1].messageTimestamp || 0))
-            .map(([id]) => id);
-          for (let i = 0; i < sortedIds.length - store.maxPerChat; i++) {
-            chatMsgs.delete(sortedIds[i]);
-          }
-        }
-      }
-
-      handler.handleMessage(sock, msg).catch(err => {
-        if (!err.message?.includes('rate-overlimit') && !err.message?.includes('not-authorized')) {
-          console.error('Error handling message:', err.message);
-        }
-      });
-
-      setImmediate(async () => {
-        if (config.autoRead && from.endsWith('@g.us')) {
-          try { await sock.readMessages([msg.key]); } catch (e) {}
-        }
-        if (from.endsWith('@g.us')) {
-          try {
-            const groupMetadata = await handler.getGroupMetadata(sock, msg.key.remoteJid);
-            if (groupMetadata) {
-              await handler.handleAntilink(sock, msg, groupMetadata);
+        // Dès qu'un QR code arrive, on le convertit en image pour le web
+        if (qr) {
+            try {
+                qrCodeImage = await QRCode.toDataURL(qr);
+                botStatus = "Scannez le QR Code ci-dessous avec votre application WhatsApp :";
+            } catch (err) {
+                console.error("Erreur de conversion du QR Code :", err);
             }
-          } catch (error) {}
         }
-      });
-    }
-  });
 
-  sock.ev.on('message-receipt.update', () => {});
-  sock.ev.on('messages.update', () => {});
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            botStatus = shouldReconnect ? "Déconnecté. Reconnexion automatique en cours..." : "Session expirée. Veuillez réinitialiser le serveur.";
+            qrCodeImage = null;
+            if (shouldReconnect) startNezuko();
+        } else if (connection === 'open') {
+            console.log('Nezuko-v1 est connecté avec succès ! ✅');
+            botStatus = "Nezuko-v1 est connecté et opérationnel ! ✅";
+            qrCodeImage = null; // Plus besoin du QR Code une fois connecté
+        }
+    });
 
-  sock.ev.on('group-participants.update', async (update) => {
-    await handler.handleGroupUpdate(sock, update);
-  });
-
-  sock.ev.on('error', (error) => {
-    const statusCode = error?.output?.statusCode;
-    if (statusCode === 515 || statusCode === 503 || statusCode === 408) return;
-    console.error('Socket error:', error.message || error);
-  });
-
-  return sock;
+    // Écoute élémentaire des messages reçus
+    sock.ev.on('messages.upsert', async (chatUpdate) => {
+        try {
+            const mek = chatUpdate.messages[0];
+            if (!mek.message) return;
+            // Ton logique de commandes de bot se place ici
+        } catch (err) {
+            console.error(err);
+        }
+    });
 }
 
-console.log('🚀 Starting WhatsApp MD Bot...\n');
-console.log(`📦 Bot Name: ${config.botName}`);
-console.log(`⚡ Prefix: ${config.prefix}`);
-const ownerNames = Array.isArray(config.ownerName) ? config.ownerName.join(',') : config.ownerName;
-console.log(`👑 Owner: ${ownerNames}\n`);
-
-cleanupPuppeteerCache();
-
-startBot().catch(err => {
-  console.error('Error starting bot:', err);
-  process.exit(1);
+// --- RENDU DU PANEL WEB SUR RENDER ---
+app.get('/', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="fr">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Nezuko-v1 - Connexion</title>
+            <style>
+                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; background-color: #0f0f12; color: #ffffff; padding: 40px 20px; }
+                .container { background: #18181f; padding: 40px; border-radius: 20px; display: inline-block; box-shadow: 0 10px 30px rgba(0,0,0,0.7); max-width: 90%; }
+                h1 { color: #ff4a5a; font-size: 2.2em; margin-bottom: 5px; }
+                .subtitle { color: #6f6f7f; margin-bottom: 30px; font-size: 1.1em; }
+                .status { font-weight: bold; font-size: 1.2em; color: #e0e0e6; background: #23232e; padding: 12px; border-radius: 10px; border: 1px solid #2e2e3e; display: inline-block; }
+                .qr-box { margin-top: 30px; }
+                img { background: white; padding: 15px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.3); width: 250px; height: 250px; }
+                .footer { margin-top: 40px; color: #4e4e5e; font-size: 0.9em; }
+            </style>
+            <script>
+                // Actualisation automatique de la page toutes les 5 secondes pour mettre à jour le statut et le QR Code
+                setInterval(() => { window.location.reload(); }, 5000);
+            </script>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Nezuko-v1</h1>
+                <div class="subtitle">Gestionnaire de déploiement WhatsApp</div>
+                <div class="status">${botStatus}</div>
+                
+                ${qrCodeImage ? `
+                <div class="qr-box">
+                    <img src="${qrCodeImage}" alt="QR Code WhatsApp"><br>
+                    <p style="color: #ff4a5a; font-size: 0.9em; margin-top: 15px;">Le code change régulièrement, scannez-le rapidement.</p>
+                </div>
+                ` : ''}
+                
+                <div class="footer">Nezuko Bot Project — Hébergé avec succès sur Render</div>
+            </div>
+        </body>
+        </html>
+    `);
 });
 
-process.on('uncaughtException', (err) => {
-  if (err.code === 'ENOSPC' || err.errno === -28 || err.message?.includes('no space left on device')) {
-    console.error('⚠️ ENOSPC Error: No space left on device. Attempting cleanup...');
-    const { cleanupOldFiles } = require('./utils/cleanup');
-    cleanupOldFiles();
-    return;
-  }
-  console.error('Uncaught Exception:', err);
+// Lancement du serveur Web Express
+app.listen(port, () => {
+    console.log(`Serveur Web actif sur le port standard : ${port}`);
 });
 
-process.on('unhandledRejection', (err) => {
-  if (err.code === 'ENOSPC' || err.errno === -28 || err.message?.includes('no space left on device')) {
-    const { cleanupOldFiles } = require('./utils/cleanup');
-    cleanupOldFiles();
-    return;
-  }
-  if (err.message && err.message.includes('rate-overlimit')) return;
-  console.error('Unhandled Rejection:', err);
-});
-
-module.exports = { store };
+// Démarrage du bot WhatsApp
+startNezuko();
